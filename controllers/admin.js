@@ -4,42 +4,42 @@ import Tag from "../schema/tagSchema.js";
 import User from "../schema/userSchema.js";
 import fs from 'fs';
 
-export const userListAdmin = async(req,res)=>{
+export const userListAdmin = async (req, res) => {
     try {
-        const response  = await User.find({role:{$ne:'admin'}})
-        console.log('user list-',response);
-        
+        const response = await User.find({ role: { $ne: 'admin' } })
+        console.log('user list-', response);
+
         res.status(200).json(response)
     } catch (error) {
-     console.log(error);
+        console.log(error);
     }
 }
-export const adminblock = async(req,res)=>{
+export const adminblock = async (req, res) => {
     try {
-        const {id} = req.body
-        const isBlock = await User.findOne({_id:id})
-        if(isBlock.adminblock==false){
-            const response = await User.findByIdAndUpdate(id,{adminblock:true},{new:true})
-            res.status(200).json({success:true})
-        }else{
-            const response = await User.findByIdAndUpdate(id,{adminblock:false},{new:true})
-            res.status(200).json({success:false})
+        const { id } = req.body
+        const isBlock = await User.findOne({ _id: id })
+        if (isBlock.adminblock == false) {
+            const response = await User.findByIdAndUpdate(id, { adminblock: true }, { new: true })
+            res.status(200).json({ success: true })
+        } else {
+            const response = await User.findByIdAndUpdate(id, { adminblock: false }, { new: true })
+            res.status(200).json({ success: false })
         }
     } catch (error) {
         console.log(error);
     }
 }
-export const fetchAllPosts = async (req,res)=>{
+export const fetchAllPosts = async (req, res) => {
     try {
-        const response =await Post.find().sort({createdAt:-1}).populate('userId','fullname email  adminblock')
+        const response = await Post.find().sort({ createdAt: -1 }).populate('userId', 'fullname email  adminblock')
         res.status(200).json(response)
     } catch (error) {
         console.log(error);
     }
 }
-export const setExplore = async(req,res) =>{
+export const setExplore = async (req, res) => {
     try {
-        const {title,subtitle} = req.body;
+        const { title, subtitle } = req.body;
         const file = req.file;
 
         if (!file) {
@@ -87,43 +87,43 @@ export const setExplore = async(req,res) =>{
             console.error("Error deleting temporary file:", err);
         }
 
-        const response = await Card.create({title,subtitle,image:imageUrl})
-        console.log('response of set explore:',response);
+        const response = await Card.create({ title, subtitle, image: imageUrl })
+        console.log('response of set explore:', response);
         res.status(200).json(response)
     } catch (error) {
         console.log(error);
         res.status(500).json({ message: "Internal server error", error: error.message });
     }
 }
-export const fetchCards= async(req,res)=>{
+export const fetchCards = async (req, res) => {
     try {
-        const response  = await Card.find()
+        const response = await Card.find()
         res.status(200).json(response)
     } catch (error) {
         console.log(error);
     }
 }
-export const removeCards = async(req,res)=>{
+export const removeCards = async (req, res) => {
     try {
-        const {cardId} = req.body
+        const { cardId } = req.body
         const response = await Card.findByIdAndDelete(cardId)
         res.status(200).json(response)
     } catch (error) {
         console.log(error);
     }
 }
-export const addCategory =async(req,res)=>{
+export const addCategory = async (req, res) => {
     try {
-        const {values} = req.body
+        const { values } = req.body
         console.log(values);
-        
+
         const response = await Tag.create(values)
         res.status(200).json(response)
     } catch (error) {
         console.log(error);
     }
 }
-export const fetchCat = async(req,res)=>{
+export const fetchCat = async (req, res) => {
     try {
         const response = await Tag.find()
         res.status(200).json(response)
@@ -131,18 +131,18 @@ export const fetchCat = async(req,res)=>{
         console.log(error);
     }
 }
-export const settags = async(req,res)=>{
+export const settags = async (req, res) => {
     try {
         const formData = req.body
         const tags = formData.tag
         const category = formData.category
-        const response =await Tag.findByIdAndUpdate(category,{$push:{tags:tags}},{new:true})
+        const response = await Tag.findByIdAndUpdate(category, { $push: { tags: tags } }, { new: true })
         res.status(200).json(response)
     } catch (error) {
         console.log(error);
     }
 }
-export const fetchTagsFromCard =async(req,res)=>{
+export const fetchTagsFromCard = async (req, res) => {
     try {
         const { cat } = req.body;
 
@@ -160,39 +160,39 @@ export const fetchTagsFromCard =async(req,res)=>{
             tags: { $in: regexTags }
         });
         res.status(200).json(posts)
-        
+
     } catch (error) {
         console.log(error);
     }
 }
 
 
-export const adminStrike = async(req,res)=>{
+export const adminStrike = async (req, res) => {
     try {
-        const {postId} = req.body
+        const { postId } = req.body
         const isStrike = await Post.findById(postId, { adminStrike: true });
-        console.log(isStrike,'isStrike');        
-        if(!isStrike.adminStrike){
-            const response = await Post.findByIdAndUpdate(postId,{adminStrike:true},{new:true})
-            res.status(200).json({success:true})
-        }else{
-            const response = await Post.findByIdAndUpdate(postId,{adminStrike:false},{new:true})
-            res.status(200).json({success:false})
+        console.log(isStrike, 'isStrike');
+        if (!isStrike.adminStrike) {
+            const response = await Post.findByIdAndUpdate(postId, { adminStrike: true }, { new: true })
+            res.status(200).json({ success: true })
+        } else {
+            const response = await Post.findByIdAndUpdate(postId, { adminStrike: false }, { new: true })
+            res.status(200).json({ success: false })
         }
 
     } catch (error) {
         console.log(error);
     }
 }
-export const fetchActions = async(req,res)=>{
+export const fetchActions = async (req, res) => {
     try {
-        const {userId,postId} = req.query
+        const { userId, postId } = req.query
         const isStrike = await Post.findById(postId, 'adminStrike');
         const isBlock = await User.findById(userId, 'adminblock');
-        console.log(isBlock?.adminblock,'isBlock');
-        console.log(isStrike?.adminStrike,'isStrike');
-        res.status(200).json({isBlock:isBlock?.adminblock || false,isStrike:isStrike?.adminStrike || false})
-        
+        console.log(isBlock?.adminblock, 'isBlock');
+        console.log(isStrike?.adminStrike, 'isStrike');
+        res.status(200).json({ isBlock: isBlock?.adminblock || false, isStrike: isStrike?.adminStrike || false })
+
     } catch (error) {
         console.log(error);
         res.status(500).json({ error: error.message });
