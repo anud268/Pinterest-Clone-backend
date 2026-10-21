@@ -8,6 +8,9 @@ import mongoose from 'mongoose';
 import router from './route/user.js';
 import dbConnect from './db.js';
 import { HttpError } from './utils/http.js';
+import { closeChatDb, connectChatDb } from './chat/db.js';
+import chatRouter from './chat/routes.js';
+import { closeChatSocket, initChatSocket } from './chat/socket.js';
 
 const PORT = process.env.PORT || 3500;
 const CLIENT_ORIGINS = (process.env.CLIENT_ORIGINS || 'http://localhost:5173,http://localhost:5174')
@@ -28,7 +31,15 @@ const app = express();
 app.disable('x-powered-by');
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '100kb' }));
+app.use((req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'DENY',
+    'Cross-Origin-Resource-Policy': 'same-site',
+  });
+  next();
+});
 app.use(cookieParser());
 app.use(
   cors({
@@ -38,6 +49,9 @@ app.use(
 );
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+// Chat key batches (Olm-encrypted room keys for several devices) can exceed 100kb
+app.use('/chat', express.json({ limit: '1mb' }), chatRouter);
+app.use(express.json({ limit: '100kb' }));
 app.use('/', router);
 
 app.use((req, res) => {
@@ -51,7 +65,7 @@ app.use((err, req, res, next) => {
   if (err instanceof HttpError) return res.status(err.status).json({ message: err.message });
 
   if (err instanceof multer.MulterError) {
-    const message = err.code === 'LIMIT_FILE_SIZE' ? 'Images must be 5MB or smaller' : 'Invalid upload';
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'That file is too large' : 'Invalid upload';
     return res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ message });
   }
   if (err instanceof mongoose.Error.CastError) return res.status(400).json({ message: `Invalid ${err.path}` });
@@ -71,11 +85,14 @@ const startServer = async () => {
   try {
     // Connect to MongoDB FIRST. If this throws, we abort — the server never starts.
     await dbConnect();
+    // Chat data lives in its own database (see chat/db.js)
+    await connectChatDb();
 
     // Only start listening after the database is confirmed connected.
     const server = app.listen(PORT, () => {
       console.log(`[Server] Running on port ${PORT} (allowed origins: ${CLIENT_ORIGINS.join(', ')})`);
     });
+    initChatSocket(server, { origins: CLIENT_ORIGINS });
 
     // ─── Graceful Shutdown ─────────────────────────────────────────────────────
     // On SIGINT (Ctrl+C) or SIGTERM (process manager / Docker stop):
@@ -85,11 +102,13 @@ const startServer = async () => {
     const shutdown = async (signal) => {
       console.log(`\n[Server] ${signal} received. Shutting down gracefully...`);
 
+      await closeChatSocket();
       server.close(async () => {
         console.log('[Server] HTTP server closed. No new requests accepted.');
         try {
           await mongoose.connection.close();
-          console.log('[DB] Connection closed.');
+          await closeChatDb();
+          console.log('[DB] Connections closed.');
         } catch (err) {
           console.error('[DB] Error closing connection:', err.message);
         }
