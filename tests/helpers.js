@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
@@ -7,22 +8,72 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 
 const backendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// Stand-in for ImageKit's upload endpoint so tests never upload real files.
+export const STUB_PRIVATE_KEY = 'test-key';
+
+// Pulls the "file" part out of a multipart/form-data body.
+const multipartFile = (body, contentType) => {
+  const boundary = /boundary=(?:"([^"]+)"|([^;]+))/.exec(contentType ?? '');
+  if (!boundary) return null;
+  const delimiter = Buffer.from(`--${boundary[1] ?? boundary[2]}`);
+  let start = body.indexOf(delimiter);
+  while (start !== -1) {
+    const next = body.indexOf(delimiter, start + delimiter.length);
+    if (next === -1) break;
+    const part = body.subarray(start + delimiter.length + 2, next - 2);
+    const headerEnd = part.indexOf('\r\n\r\n');
+    if (part.subarray(0, headerEnd).toString().includes('name="file"')) return Buffer.from(part.subarray(headerEnd + 4));
+    start = next;
+  }
+  return null;
+};
+
+// Stand-in for ImageKit (upload API + signed private-file delivery) so tests never touch the real service.
 export const startImageStub = async () => {
+  const files = new Map();
   const server = http.createServer((req, res) => {
-    req.resume();
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ url: `https://ik.imagekit.io/test/${Date.now()}.png`, width: 800, height: 1200 }));
+      const url = new URL(req.url, 'http://stub');
+      if (req.method === 'POST' && url.pathname === '/upload') {
+        const bytes = multipartFile(Buffer.concat(chunks), req.headers['content-type']);
+        const id = `file${files.size + 1}`;
+        const filePath = `/stub/${id}.bin`;
+        files.set(filePath, bytes);
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify({ url: `https://ik.imagekit.io/test${filePath}`, fileId: id, filePath, width: 800, height: 1200 }));
+      }
+      if (req.method === 'GET' && url.pathname.startsWith('/ik/')) {
+        // Check the HMAC-SHA1 URL signature exactly like ImageKit does for private files
+        const filePath = url.pathname.slice('/ik'.length);
+        const expiry = url.searchParams.get('ik-t');
+        const expected = crypto.createHmac('sha1', STUB_PRIVATE_KEY).update(filePath.slice(1) + expiry).digest('hex');
+        if (url.searchParams.get('ik-s') !== expected || Number(expiry) < Date.now() / 1000) {
+          res.statusCode = 401;
+          return res.end('bad signature');
+        }
+        if (!files.has(filePath)) {
+          res.statusCode = 404;
+          return res.end();
+        }
+        return res.end(files.get(filePath));
+      }
+      if (req.method === 'DELETE') {
+        res.statusCode = 204;
+        return res.end();
+      }
+      res.statusCode = 404;
+      res.end();
     });
   });
   server.listen(0);
   await once(server, 'listening');
-  return { server, url: `http://127.0.0.1:${server.address().port}/upload` };
+  const base = `http://127.0.0.1:${server.address().port}`;
+  return { server, files, url: `${base}/upload`, endpoint: `${base}/ik`, apiUrl: base };
 };
 
 // Boots the real API (index.js) against an in-memory MongoDB.
-export const startApi = async ({ port, imageUploadUrl }) => {
+export const startApi = async ({ port, imageUploadUrl, env = {} }) => {
   const mongo = await MongoMemoryServer.create();
   const mongoUri = mongo.getUri('pinclone_test');
   const logs = [];
@@ -37,9 +88,11 @@ export const startApi = async ({ port, imageUploadUrl }) => {
       SECRET_KEY: 'test-secret',
       EMAIL: '',
       EMAIL_PASS: '',
-      IMAGEKIT_PRIVATE_KEY: 'test-key',
+      IMAGEKIT_PRIVATE_KEY: STUB_PRIVATE_KEY,
       IMAGEKIT_UPLOAD_URL: imageUploadUrl,
       CLIENT_ORIGINS: 'http://localhost:5173',
+      CHAT_DB_NAME: 'pinclone_chat_test',
+      ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -73,8 +126,8 @@ export const startApi = async ({ port, imageUploadUrl }) => {
 // Minimal fetch wrapper that keeps one cookie jar per simulated browser.
 export const createClient = (baseUrl) => {
   let cookie = '';
-  const request = async (method, url, body, { form } = {}) => {
-    const headers = {};
+  const request = async (method, url, body, { form, headers: extra = {} } = {}) => {
+    const headers = { ...extra };
     if (cookie) headers.Cookie = cookie;
     let payload;
     if (form) payload = form;
@@ -100,7 +153,10 @@ export const createClient = (baseUrl) => {
   return {
     get: (url) => request('GET', url),
     post: (url, body, opts) => request('POST', url, body, opts),
+    request,
+    raw: async (url) => fetch(baseUrl + url, { headers: cookie ? { Cookie: cookie } : {} }),
     hasCookie: () => Boolean(cookie),
+    cookie: () => cookie,
   };
 };
 
