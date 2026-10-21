@@ -15,7 +15,7 @@ const dbConnect = async () => {
   if (!uri) {
     throw new Error(
       '[DB] MONGODB environment variable is not set. ' +
-      'Check your .env file and ensure it contains a valid MONGODB_URI.'
+      'Check your .env file and ensure it contains a valid MONGODB connection string.'
     );
   }
 

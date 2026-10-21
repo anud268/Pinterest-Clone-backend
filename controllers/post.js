@@ -1,348 +1,198 @@
-import { applyTagServ, checkHaveUserServ, deletePostServ,  fetchArchiveServ,  fetchMyPostServ, fetchNotInterestedServ, fetchPostServ,  fetchSavedPostsServ,  finalSearchServ,  notInterestedServ,  pullArchiveServ,  pullsavedItem, pusharchiveServ, pushSaveItem, removeNotInterestServ, searchTermsServ, servViewPost, updatePostServ, uploadPostServ } from "../services/post.js";
-import fs from 'fs';
+import {
+  applyTagServ,
+  deletePostServ,
+  fetchArchiveServ,
+  fetchFeedServ,
+  fetchMyPostServ,
+  fetchNotInterestedServ,
+  fetchRelatedServ,
+  fetchSavedPostsServ,
+  finalSearchServ,
+  notInterestedServ,
+  removeNotInterestServ,
+  searchTermsServ,
+  servViewPost,
+  setArchiveServ,
+  toggleSaveServ,
+  updatePostServ,
+  uploadPostServ,
+  withAuthorImages,
+} from "../services/post.js";
+import { FOLDERS, uploadImage } from "../services/imagekit.js";
+import Post from "../schema/postSchema.js";
+import { badRequest, forbidden, notFound } from "../utils/http.js";
+import { cleanString, isHttpUrl, normalizeTags, parsePagination, requireObjectId } from "../utils/validation.js";
+
+const isAdmin = (user) => user.role === "admin";
+const isOwner = (post, user) => String(post.userId?._id ?? post.userId) === String(user._id);
+
+const loadPost = async (id) => {
+  const post = await Post.findById(requireObjectId(id, "post id"));
+  if (!post) throw notFound("This post no longer exists");
+  return post;
+};
+
+const loadOwnPost = async (id, user) => {
+  const post = await loadPost(id);
+  if (!isOwner(post, user)) throw forbidden("You can only change your own posts");
+  return post;
+};
+
+// Validates the text fields shared by create and update.
+const readPostFields = (body) => {
+  const title = cleanString(body.title, 100);
+  const description = cleanString(body.description, 1000);
+  const url = cleanString(body.url, 2048);
+  if (!title) throw badRequest("Title is required");
+  if (!description) throw badRequest("Description is required");
+  if (url && !isHttpUrl(url)) throw badRequest("Destination link must start with http:// or https://");
+  return {
+    postTitle: title,
+    postDescription: description,
+    url,
+    location: cleanString(body.location, 100),
+    tags: normalizeTags(body.tags),
+  };
+};
 
 export const uploadPost = async (req, res) => {
-  try {
-    const { title, description, location, userId, url } = req.body;
-    let { tags } = req.body;
-
-    const file = req.file;
-
-    if (!file) {
-      return res.status(400).json({ message: "No file uploaded" });
-    }
-
-    if (!title || !description || !userId) {
-      return res.status(400).json({ message: "Missing required fields" });
-    }
-
-    // Parse tags safely
-    let parsedTags = [];
-
-    if (typeof tags === "string") {
-      parsedTags = tags
-        .split(",")
-        .map(tag => tag.trim())
-        .filter(tag => tag);
-    } else if (Array.isArray(tags)) {
-      parsedTags = tags;
-    }
-
-    // Read file from disk
-    const fileBuffer = fs.readFileSync(file.path);
-    const blob = new Blob([fileBuffer], { type: file.mimetype });
-
-    const formData = new FormData();
-    formData.append('file', blob, file.originalname);
-    formData.append('fileName', file.originalname);
-    formData.append('folder', '/Pinterest/Posts');
-
-    const authHeader = 'Basic ' + Buffer.from(process.env.IMAGEKIT_PRIVATE_KEY + ':').toString('base64');
-
-    // Upload to ImageKit
-    const uploadResponse = await fetch('https://upload.imagekit.io/api/v1/files/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': authHeader
-      },
-      body: formData
-    });
-
-    if (!uploadResponse.ok) {
-      const errorResult = await uploadResponse.text();
-      console.error("ImageKit upload failed for post:", errorResult);
-      try {
-        fs.unlinkSync(file.path);
-      } catch (err) {
-        console.error("Error deleting temporary file:", err);
-      }
-      return res.status(uploadResponse.status).json({ message: "ImageKit upload failed", error: errorResult });
-    }
-
-    const result = await uploadResponse.json();
-    const imageUrl = result.url;
-
-    // Clean up temporary file
-    try {
-      fs.unlinkSync(file.path);
-    } catch (err) {
-      console.error("Error deleting temporary file:", err);
-    }
-
-    // Save to DB
-    const post = await uploadPostServ(
-      {
-        postTitle: title,
-        postDescription: description,
-        url: url || "",
-        location,
-        userId,
-        postImage: imageUrl,
-      },
-      parsedTags
-    );
-
-    return res.status(200).json({
-      message: "Uploaded successfully",
-      post,
-      success: true,
-    });
-
-  } catch (error) {
-    console.error("Upload failed:", error);
-    return res.status(500).json({
-      message: "Upload failed",
-      success: false,
-    });
-  }
+  if (!req.file) throw badRequest("Please add an image");
+  const fields = readPostFields(req.body);
+  const image = await uploadImage(req.file, FOLDERS.posts);
+  const post = await uploadPostServ({
+    ...fields,
+    userId: req.user._id,
+    postImage: image.url,
+    imageWidth: image.width,
+    imageHeight: image.height,
+  });
+  res.status(201).json({ message: "Pin created", post });
 };
 
+export const fetchPost = async (req, res) => {
+  const page = parsePagination(req.query);
+  const { posts, hasMore } = await fetchFeedServ(req.user._id, page);
+  res.status(200).json({ posts, page: page.page, hasMore });
+};
 
+export const viewPost = async (req, res) => {
+  const post = await servViewPost(requireObjectId(req.params.id, "post id"));
+  if (!post || !post.userId) throw notFound("This post no longer exists");
 
+  // Only the owner or an admin can open archived, struck or blocked-author posts
+  const hidden = post.archive || post.adminStrike || post.userId.adminblock;
+  if (hidden && !isOwner(post, req.user) && !isAdmin(req.user)) throw notFound("This post is unavailable");
 
-export const fetchPost =async (req,res) => {
-    try {
-        const {id} = req.params
+  res.status(200).json({ post: await withAuthorImages(post) });
+};
 
-        const posts = await fetchPostServ(id)
-        res.status(200).json(posts)
-        
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const viewPost =async(req,res)=>{
-    try {
-        const {id} = req.params
-        const response = await servViewPost(id)
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
-}
+export const relatedPosts = async (req, res) => {
+  const post = await loadPost(req.params.id);
+  res.status(200).json({ posts: await fetchRelatedServ(post, req.user._id) });
+};
 
+export const fetchMyPost = async (req, res) => {
+  const authorId = requireObjectId(req.params.id, "user id");
+  const posts = await fetchMyPostServ(authorId, { isOwner: authorId === String(req.user._id) });
+  res.status(200).json({ posts });
+};
 
+export const deletePost = async (req, res) => {
+  const post = await loadPost(req.body?.postId);
+  if (!isOwner(post, req.user) && !isAdmin(req.user)) throw forbidden("You can only delete your own posts");
+  await deletePostServ(post._id);
+  res.status(200).json({ message: "Pin deleted" });
+};
 
-export const fetchMyPost =async (req,res) => {
-    try {
-        
-        const {id}  = req.params
-        const posts = await fetchMyPostServ(id)
-        res.status(200).json(posts)
-        
-    } catch (error) {
-        console.log(error);
-    }
-}
-
-export const deletePost = async(req,res)=>{
-    try {
-        const {postId} = req.body
-        const response = await deletePostServ(postId)
-        res.status(200).json({message:'post deleted successfully'})
-        
-    } catch (error) {
-     console.log(error);
-    }
-}
 export const updatePost = async (req, res) => {
-    try {
-        const { postId } = req.params;
-        
-        // Read from body (FormData) or query params
-        const title = req.body.title !== undefined ? req.body.title : req.query.title;
-        const description = req.body.description !== undefined ? req.body.description : req.query.description;
-        const location = req.body.location !== undefined ? req.body.location : req.query.location;
-        const url = req.body.url !== undefined ? req.body.url : req.query.url;
-        let tags = req.body.tags !== undefined ? req.body.tags : req.query.tags;
+  const post = await loadOwnPost(req.params.postId, req.user);
+  const update = readPostFields(req.body);
 
-        // Convert tags string to array
-        if (typeof tags === 'string') {
-            tags = tags.split(',').map(tag => tag.trim()).filter(tag => tag !== "");
-        } else if (!Array.isArray(tags)) {
-            tags = [];
-        }
+  if (req.file) {
+    const image = await uploadImage(req.file, FOLDERS.posts);
+    Object.assign(update, { postImage: image.url, imageWidth: image.width, imageHeight: image.height });
+  }
 
-        const updateData = {
-            postTitle: title,
-            postDescription: description,
-            location: location,
-            tags: tags,
-            url: url,
-        };
-
-        // If a new image file is uploaded
-        if (req.file) {
-            const file = req.file;
-
-            // Read file from disk
-            const fileBuffer = fs.readFileSync(file.path);
-            const blob = new Blob([fileBuffer], { type: file.mimetype });
-
-            const formData = new FormData();
-            formData.append('file', blob, file.originalname);
-            formData.append('fileName', file.originalname);
-            formData.append('folder', '/Pinterest/Posts');
-
-            const authHeader = 'Basic ' + Buffer.from(process.env.IMAGEKIT_PRIVATE_KEY + ':').toString('base64');
-
-            // Upload to ImageKit
-            const uploadResponse = await fetch('https://upload.imagekit.io/api/v1/files/upload', {
-                method: 'POST',
-                headers: {
-                    'Authorization': authHeader
-                },
-                body: formData
-            });
-
-            if (!uploadResponse.ok) {
-                const errorResult = await uploadResponse.text();
-                console.error("ImageKit upload failed during update:", errorResult);
-                try {
-                    fs.unlinkSync(file.path);
-                } catch (err) {
-                    console.error("Error deleting temporary file:", err);
-                }
-                return res.status(uploadResponse.status).json({ message: "ImageKit upload failed", error: errorResult });
-            }
-
-            const result = await uploadResponse.json();
-            updateData.postImage = result.url; // Save new ImageKit URL
-
-            // Clean up temporary file
-            try {
-                fs.unlinkSync(file.path);
-            } catch (err) {
-                console.error("Error deleting temporary file:", err);
-            }
-        }
-
-        const update = await updatePostServ(postId, updateData);
-
-        res.status(200).json({ update, success: true });
-
-    } catch (error) {
-        console.log(error);
-        res.status(500).json({ message: "Internal server error", error: error.message });
-    }
+  const updated = await updatePostServ(post._id, update);
+  res.status(200).json({ message: "Pin updated", post: updated });
 };
-
 
 //save
-export const pushSave = async(req,res)=>{
-    try {
-        const {postId,userId} = req.body
-        //find user
-        const haveUser = await checkHaveUserServ(postId,userId)
+export const pushSave = async (req, res) => {
+  const post = await loadPost(req.body?.postId);
+  const saved = await toggleSaveServ(post._id, req.user._id);
+  res.status(200).json({ saved, message: saved ? "Saved to your profile" : "Removed from saved" });
+};
 
-        if(!haveUser){
-            //push postId
-            const savedPosts = await pushSaveItem(postId,userId)
-            res.status(200).json({message:'post saved successfully',success:true})
-        }else{
-            //pull postId
-            const removeSave = await pullsavedItem(postId,userId)
-            res.status(200).json({message:'remove post from saved',success:false})
-        }
-    } catch (error) {
-        console.log(error);
-    }
-}
-
-export const fetchSavedPosts = async(req,res) =>{
-    try {
-        const {userId} = req.params
-        const savedPosts = await fetchSavedPostsServ(userId)
-        res.status(200).json(savedPosts)
-    } catch (error) {
-        console.log(error);
-    }
-}
+export const fetchSavedPosts = async (req, res) => {
+  const userId = requireObjectId(req.params.userId, "user id");
+  if (userId !== String(req.user._id)) throw forbidden("Saved pins are private");
+  res.status(200).json({ posts: await fetchSavedPostsServ(userId) });
+};
 
 //archive
 
-export const fetchArchivePost =async (req,res) => {
-    try {
-        const {userId} = req.params
-        
-        const posts = await fetchArchiveServ(userId)
-        
-        res.status(200).json(posts)
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const archivePost = async(req,res)=>{
-    try {
-        const {postId,userId} = req.body
-        const arvhive = pusharchiveServ(postId,userId)
-        res.status(200).json({message:'post is archived'})
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const unArchivePost = async(req,res)=>{
-    try {
-        const {postId,userId} = req.body
-        const arvhive = pullArchiveServ(postId,userId)
-        res.status(200).json({message:'posta is unarchived'})
-    } catch (error) {
-        console.log(error);
-    }
-}
-//search
-export const searchTerms =async (req,res)=>{
-    try {
-        const {searchValue,select,userId} = req.query
-        const result = await searchTermsServ(searchValue,select,userId)
-        res.status(200).json(result)
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const finalSearch =async(req,res)=>{
-    try {
-        const {searchValue,select} = req.body
-        const result  = await finalSearchServ(searchValue,select)
-        res.status(200).json(result)
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const notInterested =async(req,res)=>{
-    try {
-        const {userId,postId} = req.body
-        const response = await notInterestedServ(userId,postId)
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const fetchNotInterested =async(req,res)=>{
-    try {
-        const {id} = req.params
-        const response = await fetchNotInterestedServ(id)
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const removeNotInterest =async(req,res)=>{
-    try {const {postId,userId} = req.body
-        const response = await removeNotInterestServ(postId,userId)
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
-}
+export const fetchArchivePost = async (req, res) => {
+  const userId = requireObjectId(req.params.userId, "user id");
+  if (userId !== String(req.user._id)) throw forbidden("Archived pins are private");
+  res.status(200).json({ posts: await fetchArchiveServ(userId) });
+};
 
-export const applyTag = async(req,res)=>{
-    try {
-        const {value} = req.params
-        const response = await applyTagServ(value)
-        res.status(200).json(response)
-        
-    } catch (error) {
-        console.log(error);
-    }
-}
+export const archivePost = async (req, res) => {
+  const post = await loadOwnPost(req.body?.postId, req.user);
+  await setArchiveServ(post._id, true);
+  res.status(200).json({ message: "Pin archived" });
+};
+
+export const unArchivePost = async (req, res) => {
+  const post = await loadOwnPost(req.body?.postId, req.user);
+  await setArchiveServ(post._id, false);
+  res.status(200).json({ message: "Pin restored" });
+};
+
+//search
+const SEARCH_TYPES = ["Title", "Tag", "Location", "User"];
+
+const readSearch = (source) => {
+  const searchValue = cleanString(source.searchValue, 100);
+  const select = SEARCH_TYPES.includes(source.select) ? source.select : "Title";
+  return { searchValue, select };
+};
+
+export const searchTerms = async (req, res) => {
+  const { searchValue, select } = readSearch(req.query);
+  if (!searchValue) return res.status(200).json({ results: [] });
+  res.status(200).json({ results: await searchTermsServ(searchValue, select, req.user._id) });
+};
+
+export const finalSearch = async (req, res) => {
+  const { searchValue, select } = readSearch(req.body ?? {});
+  if (!searchValue) return res.status(200).json({ posts: [], page: 1, hasMore: false });
+  const page = parsePagination(req.body ?? {});
+  const { posts, hasMore } = await finalSearchServ(searchValue, select, req.user._id, page);
+  res.status(200).json({ posts, page: page.page, hasMore });
+};
+
+export const notInterested = async (req, res) => {
+  const post = await loadPost(req.body?.postId);
+  if (isOwner(post, req.user)) throw badRequest("You can't hide your own pin");
+  await notInterestedServ(req.user._id, post._id);
+  res.status(200).json({ message: "We'll show you fewer pins like this" });
+};
+
+export const fetchNotInterested = async (req, res) => {
+  const userId = requireObjectId(req.params.id, "user id");
+  if (userId !== String(req.user._id)) throw forbidden();
+  res.status(200).json({ posts: await fetchNotInterestedServ(userId) });
+};
+
+export const removeNotInterest = async (req, res) => {
+  const post = await loadPost(req.body?.postId);
+  await removeNotInterestServ(post._id, req.user._id);
+  res.status(200).json({ message: "Pin restored to your feed" });
+};
+
+export const applyTag = async (req, res) => {
+  const value = cleanString(req.params.value, 50);
+  res.status(200).json({ tags: value ? await applyTagServ(value) : [] });
+};

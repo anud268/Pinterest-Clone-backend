@@ -2,199 +2,100 @@ import Card from "../schema/adminSchema.js";
 import Post from "../schema/postSchema.js";
 import Tag from "../schema/tagSchema.js";
 import User from "../schema/userSchema.js";
-import fs from 'fs';
+import { FOLDERS, uploadImage } from "../services/imagekit.js";
+import { postsForCategoryServ, withAuthorImages } from "../services/post.js";
+import { profileImagesServ } from "../services/user.js";
+import { badRequest, conflict, notFound } from "../utils/http.js";
+import { cleanString, parsePagination, requireObjectId } from "../utils/validation.js";
+
+const TAG_PATTERN = /^#[A-Za-z0-9_]{1,40}$/
 
 export const userListAdmin = async (req, res) => {
-    try {
-        const response = await User.find({ role: { $ne: 'admin' } })
-        console.log('user list-', response);
-
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+    const users = await User.find({ role: { $ne: 'admin' } }).sort({ createdAt: -1 })
+    const images = await profileImagesServ(users.map((u) => u._id))
+    res.status(200).json({ users: users.map((u) => ({ ...u.toJSON(), image: images.get(String(u._id)) || null })) })
 }
+
 export const adminblock = async (req, res) => {
-    try {
-        const { id } = req.body
-        const isBlock = await User.findOne({ _id: id })
-        if (isBlock.adminblock == false) {
-            const response = await User.findByIdAndUpdate(id, { adminblock: true }, { new: true })
-            res.status(200).json({ success: true })
-        } else {
-            const response = await User.findByIdAndUpdate(id, { adminblock: false }, { new: true })
-            res.status(200).json({ success: false })
-        }
-    } catch (error) {
-        console.log(error);
-    }
+    const id = requireObjectId(req.body?.id, 'user id')
+    const user = await User.findById(id)
+    if (!user) throw notFound('User not found')
+    if (user.role === 'admin') throw badRequest("Administrators can't be blocked")
+
+    const blocked = !user.adminblock
+    await User.updateOne({ _id: id }, { adminblock: blocked })
+    res.status(200).json({ blocked, message: blocked ? 'User blocked' : 'User unblocked' })
 }
+
 export const fetchAllPosts = async (req, res) => {
-    try {
-        const response = await Post.find().sort({ createdAt: -1 }).populate('userId', 'fullname email  adminblock')
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+    const posts = await Post.find().sort({ createdAt: -1 }).populate('userId', 'fullname email adminblock')
+    res.status(200).json({ posts: await withAuthorImages(posts) })
 }
+
 export const setExplore = async (req, res) => {
-    try {
-        const { title, subtitle } = req.body;
-        const file = req.file;
+    const title = cleanString(req.body?.title, 60)
+    const subtitle = cleanString(req.body?.subtitle, 200)
+    if (!req.file) throw badRequest('Please choose an image')
+    if (!title) throw badRequest('Please choose a category')
+    if (!(await Tag.exists({ category: title }))) throw badRequest('That category does not exist')
 
-        if (!file) {
-            return res.status(400).json({ message: "No image file provided" });
-        }
-
-        // Read file from disk
-        const fileBuffer = fs.readFileSync(file.path);
-        const blob = new Blob([fileBuffer], { type: file.mimetype });
-
-        const formData = new FormData();
-        formData.append('file', blob, file.originalname);
-        formData.append('fileName', file.originalname);
-        formData.append('folder', '/Pinterest/ExploreManage');
-
-        const authHeader = 'Basic ' + Buffer.from(process.env.IMAGEKIT_PRIVATE_KEY + ':').toString('base64');
-
-        // Upload to ImageKit
-        const uploadResponse = await fetch('https://upload.imagekit.io/api/v1/files/upload', {
-            method: 'POST',
-            headers: {
-                'Authorization': authHeader
-            },
-            body: formData
-        });
-
-        if (!uploadResponse.ok) {
-            const errorResult = await uploadResponse.text();
-            console.error("ImageKit upload failed for explore card:", errorResult);
-            try {
-                fs.unlinkSync(file.path);
-            } catch (err) {
-                console.error("Error deleting temporary file:", err);
-            }
-            return res.status(uploadResponse.status).json({ message: "ImageKit upload failed", error: errorResult });
-        }
-
-        const result = await uploadResponse.json();
-        const imageUrl = result.url;
-
-        // Clean up temporary file
-        try {
-            fs.unlinkSync(file.path);
-        } catch (err) {
-            console.error("Error deleting temporary file:", err);
-        }
-
-        const response = await Card.create({ title, subtitle, image: imageUrl })
-        console.log('response of set explore:', response);
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-        res.status(500).json({ message: "Internal server error", error: error.message });
-    }
+    const { url } = await uploadImage(req.file, FOLDERS.explore)
+    const card = await Card.create({ title, subtitle, image: url })
+    res.status(201).json({ card })
 }
+
 export const fetchCards = async (req, res) => {
-    try {
-        const response = await Card.find()
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+    res.status(200).json({ cards: await Card.find().sort({ createdAt: -1 }) })
 }
+
 export const removeCards = async (req, res) => {
-    try {
-        const { cardId } = req.body
-        const response = await Card.findByIdAndDelete(cardId)
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+    const card = await Card.findByIdAndDelete(requireObjectId(req.body?.cardId, 'card id'))
+    if (!card) throw notFound('Card not found')
+    res.status(200).json({ message: 'Card removed' })
 }
+
 export const addCategory = async (req, res) => {
-    try {
-        const { values } = req.body
-        console.log(values);
-
-        const response = await Tag.create(values)
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+    const category = cleanString((req.body?.values ?? req.body)?.category, 60)
+    if (!category) throw badRequest('Category name is required')
+    if (await Tag.exists({ category })) throw conflict('That category already exists')
+    res.status(201).json({ category: await Tag.create({ category, tags: [] }) })
 }
+
 export const fetchCat = async (req, res) => {
-    try {
-        const response = await Tag.find()
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+    res.status(200).json({ categories: await Tag.find().sort({ category: 1 }) })
 }
+
 export const settags = async (req, res) => {
-    try {
-        const formData = req.body
-        const tags = formData.tag
-        const category = formData.category
-        const response = await Tag.findByIdAndUpdate(category, { $push: { tags: tags } }, { new: true })
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
+    const tag = cleanString(req.body?.tag, 41)
+    const categoryId = requireObjectId(req.body?.category, 'category')
+    if (!TAG_PATTERN.test(tag)) {
+        throw badRequest("Tags start with '#' and use only letters, numbers or underscores")
     }
+    const category = await Tag.findByIdAndUpdate(categoryId, { $addToSet: { tags: tag } }, { new: true })
+    if (!category) throw notFound('Category not found')
+    res.status(200).json({ category })
 }
+
 export const fetchTagsFromCard = async (req, res) => {
-    try {
-        const { cat } = req.body;
-
-        // Fetch all Tag documents that match the given category
-        const categoryDocs = await Tag.find({ category: cat });
-
-        // Flatten all tags from the matched categories
-        const allTags = categoryDocs.flatMap(doc => doc.tags);
-
-        // Convert each tag into a regex pattern (case-insensitive)
-        const regexTags = allTags.map(tag => new RegExp(tag, 'i'));
-
-        // Find posts that have any matching tags
-        const posts = await Post.find({
-            tags: { $in: regexTags }
-        });
-        res.status(200).json(posts)
-
-    } catch (error) {
-        console.log(error);
-    }
+    const category = cleanString(req.body?.cat, 60)
+    if (!category) throw badRequest('Category is required')
+    const page = parsePagination(req.body ?? {})
+    const { posts, hasMore } = await postsForCategoryServ(category, req.user._id, page)
+    res.status(200).json({ posts, page: page.page, hasMore })
 }
-
 
 export const adminStrike = async (req, res) => {
-    try {
-        const { postId } = req.body
-        const isStrike = await Post.findById(postId, { adminStrike: true });
-        console.log(isStrike, 'isStrike');
-        if (!isStrike.adminStrike) {
-            const response = await Post.findByIdAndUpdate(postId, { adminStrike: true }, { new: true })
-            res.status(200).json({ success: true })
-        } else {
-            const response = await Post.findByIdAndUpdate(postId, { adminStrike: false }, { new: true })
-            res.status(200).json({ success: false })
-        }
-
-    } catch (error) {
-        console.log(error);
-    }
+    const postId = requireObjectId(req.body?.postId, 'post id')
+    const post = await Post.findById(postId, 'adminStrike')
+    if (!post) throw notFound('Post not found')
+    const striked = !post.adminStrike
+    await Post.updateOne({ _id: postId }, { adminStrike: striked })
+    res.status(200).json({ striked, message: striked ? 'Post struck' : 'Strike removed' })
 }
-export const fetchActions = async (req, res) => {
-    try {
-        const { userId, postId } = req.query
-        const isStrike = await Post.findById(postId, 'adminStrike');
-        const isBlock = await User.findById(userId, 'adminblock');
-        console.log(isBlock?.adminblock, 'isBlock');
-        console.log(isStrike?.adminStrike, 'isStrike');
-        res.status(200).json({ isBlock: isBlock?.adminblock || false, isStrike: isStrike?.adminStrike || false })
 
-    } catch (error) {
-        console.log(error);
-        res.status(500).json({ error: error.message });
-    }
+export const fetchActions = async (req, res) => {
+    const userId = requireObjectId(req.query.userId, 'user id')
+    const postId = requireObjectId(req.query.postId, 'post id')
+    const [post, user] = await Promise.all([Post.findById(postId, 'adminStrike'), User.findById(userId, 'adminblock')])
+    res.status(200).json({ isBlock: Boolean(user?.adminblock), isStrike: Boolean(post?.adminStrike) })
 }
