@@ -1,351 +1,178 @@
 import bcrypt from 'bcrypt'
-import nodemailer from 'nodemailer'
-import jwt from 'jsonwebtoken'
-import dotenv from 'dotenv'
-dotenv.config()
+import {
+    blockedUsersServ,
+    createOtpServ,
+    fetchIsblockServ,
+    fetchProfilePicServ,
+    findUserByEmailServ,
+    FindUserProfile,
+    markEmailVerifiedServ,
+    signupServ,
+    toPublicUser,
+    upsertProfileServ,
+    userBlockServ,
+    verifyOtpServ,
+} from "../services/user.js"
+import { sendOtpEmail } from '../services/mailer.js'
+import { FOLDERS, uploadImage } from '../services/imagekit.js'
+import { clearAuthCookie, setAuthCookie } from '../middleware/auth.js'
+import User from '../schema/userSchema.js'
+import { badRequest, conflict, forbidden, notFound, unauthorized } from '../utils/http.js'
+import { cleanString, requireObjectId } from '../utils/validation.js'
 
-import { blockedUsersServ, checkEmailServ, fetchIsblockServ, fetchProfilePicServ, FindUserProfile, removeOtpServ, reqOtpServ, setProfileServ, signinServ, signupServ, updateProfileServ, userBlockServ, userDetialsServ } from "../services/user.js"
-import passport from 'passport'
-import { response } from 'express'
-import fs from 'fs'
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
-const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString(); 
+// The frontend historically posted `{ values: {...} }`; accept that or a flat body.
+const formValues = (req) => req.body?.values ?? req.body ?? {}
 
-const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.EMAIL,
-        pass: process.env.EMAIL_PASS, 
-    },
-});
-
-const sendOTPEmail = async (email, otp) => {
-    await transporter.sendMail({
-        from: process.env.EMAIL,
-        to: email,
-        subject: 'Your otp code',
-        html: `<h3>Your OTP is: <b>${otp}</b></h3><p>It is valid for 5 minutes.</p>`,
-    });
-};
-
-const requestOtp = async (email,otp) => {
-  try {
-    await sendOTPEmail(email, otp);
-    const setOtp = await reqOtpServ( email, otp );  
-    return setOtp
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-};
-
-export const signup = async(req,res) =>{
-    
-    try {
-        const {values} = req.body
-        console.log('values===',values);
-        
-        const email = values.email
-        const fullname = values.fullname
-        const password = values.password
-        const otp = generateOTP();
-        const setOtp = await requestOtp(email,otp)
-        const hashedPassword = await bcrypt.hash(values.password,10)
-        const data ={email,fullname,password:hashedPassword}
-        const checkUser = await checkEmailServ(email)
-        console.log('check user-',checkUser);
-        
-        if(!checkUser){
-            
-            const user = await signupServ(data)
-            
-            await createToken(res,user)
-            res.status(200).json({user,setOtp,success:true})
-        }else{
-            console.log('User already exist');
-            
-            res.status(200).json({message:'This email already exist'})
-        }
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const createToken =async(res,user)=>{
-    try {
-        
-        console.log('userId-',user);
-        const token = jwt.sign(
-            {userId:user._id},
-            process.env.SECRET_KEY
-        )
-        console.log('token-',token);
-        res.cookie('token',token,{
-                httpOnly:true,
-                secure: true,        
-                sameSite: 'strict',  
-                maxAge: 86400000       
-            });
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const removeToken =async(res)=>{
-    try {
-        res.clearCookie('token', {
-            httpOnly: true,
-            secure: false,
-            sameSite: 'Lax',
-        });
-        // res.status(200).json({ message: 'Cookie cleared' });
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const logout= async(req,res)=>{
-    try {
-        await removeToken(res)
-        res.status(200).json({ message: 'Cookie cleared' });
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const removeOtp =async(req,res)=>{
-    try {
-        const {otpId} = req.body
-        const remove = await removeOtpServ(otpId)
-        res.status(200).json({message:'OTP removed'})
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const resendOtp=async(req,res)=>{
-    try {
-        const {email} = req.body
-        const otp = generateOTP()
-        const setOtp = await requestOtp(email,otp)
-        res.status(200).json({setOtp,success:true})
-    } catch (error) {
-        console.log(error);
-    }
+const readEmail = (value) => {
+    const email = cleanString(value, 254).toLowerCase()
+    if (!EMAIL_PATTERN.test(email)) throw badRequest('Please enter a valid email address')
+    return email
 }
 
-export const signin = async(req,res) =>{
-    try {
-        const {values} = req.body 
-        console.log('signin values 1-',values.password);
-        
-        const user = await signinServ(values)
-        console.log('signin values 2-',user);
-        if(user.success==false){
-            res.status(200).json({message:'This user not exist please check your mail address!'});
-        }else{
-        const isMatch = await bcrypt.compare(values.password, user.password);
-        if (isMatch) {
-            await createToken(res,user)
-            res.status(200).json(user)
-        } else {
-            
-            res.status(200).json({message:"Your password is Wrong!"})
-        }
-    }
-        
-    } catch (error) {
-        console.log(error);
-    }
+const sendNewOtp = async (email) => {
+    const { code, ttlMinutes } = await createOtpServ(email)
+    await sendOtpEmail(email, code, ttlMinutes)
 }
 
-export const fetchUser = async(req,res) =>{
-    try {
-        const token = req.cookies.token
-        console.log('token fron fetch user',token);
-        if(!token){
-            res.status(200).json({message:'token not exist, User not found'})
-        }else{
-            const user = jwt.verify(token,process.env.SECRET_KEY)
-            console.log('decoded token',user);
-            const userDetials = await userDetialsServ(user.userId)
-            console.log('user detials-',userDetials);
-            res.status(200).json(userDetials)
-        }
-        
-    } catch (error) {
-        console.log(error);
+const sessionUser = async (user) => toPublicUser(user, await FindUserProfile(user._id), { includeEmail: true })
+
+export const signup = async (req, res) => {
+    const values = formValues(req)
+    const email = readEmail(values.email)
+    const fullname = cleanString(values.fullname, 50)
+    const password = typeof values.password === 'string' ? values.password : ''
+
+    if (fullname.length < 3) throw badRequest('Username must be at least 3 characters')
+    if (password.length < 6) throw badRequest('Password must be at least 6 characters')
+
+    const existing = await findUserByEmailServ(email)
+    if (existing) {
+        if (existing.emailVerified !== false) throw conflict('An account with this email already exists. Please sign in.')
+        // Unverified account: send a new code so the person can finish signing up
+        await sendNewOtp(existing.email)
+        return res.status(200).json({ needsVerification: true, email: existing.email, message: 'We sent you a new verification code' })
     }
+
+    await signupServ({ email, fullname, password })
+    await sendNewOtp(email)
+    res.status(201).json({ needsVerification: true, email, message: 'Check your email for a verification code' })
 }
 
+export const verifyOtp = async (req, res) => {
+    const email = readEmail(req.body?.email)
+    const otp = cleanString(String(req.body?.otp ?? ''), 6)
+    if (!/^\d{6}$/.test(otp)) throw badRequest('Enter the 6-digit code from your email')
 
+    const user = await findUserByEmailServ(email)
+    if (!user) throw badRequest('This code has expired. Please request a new one.')
+
+    await verifyOtpServ(user.email, otp)
+    const verified = user.emailVerified === false ? await markEmailVerifiedServ(user._id) : user
+    setAuthCookie(res, verified)
+    res.status(200).json({ user: await sessionUser(verified) })
+}
+
+export const resendOtp = async (req, res) => {
+    const email = readEmail(req.body?.email)
+    const user = await findUserByEmailServ(email)
+    // Same response either way so this endpoint can't be used to discover accounts
+    if (user && user.emailVerified === false) await sendNewOtp(user.email)
+    res.status(200).json({ message: 'If that account needs verification, a new code is on its way' })
+}
+
+export const signin = async (req, res) => {
+    const values = formValues(req)
+    const email = readEmail(values.email)
+    const password = typeof values.password === 'string' ? values.password : ''
+    if (!password) throw badRequest('Please enter your password')
+
+    const user = await findUserByEmailServ(email, { withPassword: true })
+    const isMatch = user ? await bcrypt.compare(password, user.password) : false
+    if (!isMatch) throw unauthorized('Incorrect email or password')
+
+    if (user.emailVerified === false) {
+        await sendNewOtp(user.email)
+        return res.status(403).json({ needsVerification: true, email: user.email, message: 'Please verify your email. We sent you a new code.' })
+    }
+
+    setAuthCookie(res, user)
+    res.status(200).json({ user: await sessionUser(user) })
+}
+
+export const logout = (req, res) => {
+    clearAuthCookie(res)
+    res.status(200).json({ message: 'Signed out' })
+}
+
+export const fetchUser = async (req, res) => {
+    res.status(200).json({ user: await sessionUser(req.user) })
+}
 
 //profile
 
-export const profilepic = async(req,res)=>{
-    try {
-        const {userId} = req.body;
-        const file = req.file;
-
-        if (!file) {
-            return res.status(400).json({ message: "No image file provided" });
-        }
-
-        // Read file from disk
-        const fileBuffer = fs.readFileSync(file.path);
-        const blob = new Blob([fileBuffer], { type: file.mimetype });
-        
-        const formData = new FormData();
-        formData.append('file', blob, file.originalname);
-        formData.append('fileName', file.originalname);
-        formData.append('folder', '/Home/Pinterest/ProfilePicture');
-        
-        const authHeader = 'Basic ' + Buffer.from(process.env.IMAGEKIT_PRIVATE_KEY + ':').toString('base64');
-        
-        // Upload to ImageKit
-        const uploadResponse = await fetch('https://upload.imagekit.io/api/v1/files/upload', {
-            method: 'POST',
-            headers: {
-                'Authorization': authHeader
-            },
-            body: formData
-        });
-        
-        if (!uploadResponse.ok) {
-            const errorResult = await uploadResponse.text();
-            console.error("ImageKit upload failed:", errorResult);
-            try {
-                fs.unlinkSync(file.path);
-            } catch (err) {
-                console.error("Error deleting temporary file:", err);
-            }
-            return res.status(uploadResponse.status).json({ message: "ImageKit upload failed", error: errorResult });
-        }
-        
-        const result = await uploadResponse.json();
-        const imageUrl = result.url;
-        console.log('Uploaded image URL:', imageUrl);
-        
-        // Clean up temporary file
-        try {
-            fs.unlinkSync(file.path);
-        } catch (err) {
-            console.error("Error deleting temporary file:", err);
-        }
-        
-        const userDataExist = await FindUserProfile(userId);
-        console.log('userDataExist-', userDataExist);
-        
-        if (imageUrl) {
-            if (userDataExist == null) {
-                const response = await setProfileServ({image:imageUrl,userId:userId})
-                res.status(200).json(response)
-            } else {
-                const updateData = await updateProfileServ(userId,{image:imageUrl,})
-                res.status(200).json(updateData)
-            }
-        } else {
-            res.status(500).json({ message: "Uploaded image URL is empty" });
-        }
-
-    } catch (error) {
-        console.log(error);
-        res.status(500).json({ message: "Internal server error", error: error.message });
-    }
+export const profilepic = async (req, res) => {
+    if (!req.file) throw badRequest('Please choose an image to upload')
+    const { url } = await uploadImage(req.file, FOLDERS.profile)
+    const profile = await upsertProfileServ(req.user._id, { image: url })
+    res.status(200).json({ profile })
 }
 
-
-export const setProfile = async(req,res)=>{
-    try {
-        const {values,userId} = req.body
-        console.log('valuesssssssssssss',values);
-        
-        
-        
-        const userDataExist = await FindUserProfile(userId)
-        console.log('userDataExist-',userDataExist);
-       
-        if(userDataExist==null){
-            const response = await setProfileServ({
-                // image:s3Url,
-                firstname:values.firstname,
-                lastname:values.lastname,
-                bio:values.bio,
-                country:values.country,
-                state:values.state,
-                userId:userId
-            })
-            res.status(200).json(response)
-        }else{
-            const updateData = await updateProfileServ(userId,{
-                // image:s3Url,
-                firstname:values.firstname,
-                lastname:values.lastname,
-                bio:values.bio,
-                country:values.country,
-                state:values.state
-            })
-            res.status(200).json(updateData)
-        }
-        
-    } catch (error) {
-        console.log(error); 
+export const setProfile = async (req, res) => {
+    const values = formValues(req)
+    const fields = {}
+    for (const [key, max] of [['firstname', 50], ['lastname', 50], ['bio', 300], ['country', 60], ['state', 60]]) {
+        if (values[key] !== undefined) fields[key] = cleanString(values[key], max) || null
     }
-}
-export const userProfile = async (req,res)=>{
-    try {
-        const userId = req.params.id
-        
-        const response = await FindUserProfile(userId)
-        
-        res.status(200).json(response)
-        
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const fetchProfilePic = async(req,res)=>{
-    try {
-        console.log('id--',req.params);
-        const {id} = req.params
-        console.log('id--',id);
-        
-        const pic = await fetchProfilePicServ(id)
-        res.status(200).json(pic)
-    } catch (error) {
-        console.log(error);
-    }
+    const profile = await upsertProfileServ(req.user._id, fields)
+    res.status(200).json({ profile })
 }
 
-export const userBlock =async(req,res)=>{
-    try {
-        console.log(';helllllllllll');
-        
-        const {id,userId} = req.body
-        const response = await userBlockServ(id,userId) 
-        res.status(200).json(response)
+export const userProfile = async (req, res) => {
+    const userId = requireObjectId(req.params.id, 'user id')
+    const user = await User.findById(userId)
+    if (!user) throw notFound('This profile does not exist')
 
-        
-    } catch (error) {
-        console.log(error);
-    }
+    const isSelf = String(user._id) === String(req.user._id)
+    const isAdmin = req.user.role === 'admin'
+    if (user.adminblock && !isSelf && !isAdmin) throw notFound('This profile is unavailable')
+
+    const profile = await FindUserProfile(userId)
+    res.status(200).json({
+        profile: {
+            ...toPublicUser(user, profile, { includeEmail: isSelf || isAdmin }),
+            userId: user._id,
+            firstname: profile?.firstname || null,
+            lastname: profile?.lastname || null,
+            bio: profile?.bio || null,
+            country: profile?.country || null,
+            state: profile?.state || null,
+        },
+    })
 }
 
-export const fetchIsblock = async(req,res)=>{
-    try {
-        console.log(req.query,'++++++++++++++++++++++');
-        const {userId,blockUserId} = req.query
-        console.log(userId,'++++++++++++++++++++++');
-        console.log(blockUserId,'++++++++++++++++++++++');
-        const response =await fetchIsblockServ(userId,blockUserId)
-        console.log(response,'*********************************');
-        
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+export const fetchProfilePic = async (req, res) => {
+    const userId = requireObjectId(req.params.id, 'user id')
+    res.status(200).json({ image: await fetchProfilePicServ(userId) })
 }
 
-export const blockedUsers =async(req,res)=>{
-    try {
-        const {id} = req.params
-        const response = await blockedUsersServ(id)
-        res.status(200).json(response)
-    } catch (error) {
-        console.log(error);
-    }
+export const userBlock = async (req, res) => {
+    const targetId = requireObjectId(req.body?.id, 'user id')
+    if (targetId === String(req.user._id)) throw badRequest("You can't block yourself")
+    if (!(await User.exists({ _id: targetId }))) throw notFound('User not found')
+
+    const blocked = await userBlockServ(targetId, String(req.user._id))
+    res.status(200).json({ blocked, message: blocked ? 'User blocked' : 'User unblocked' })
+}
+
+export const fetchIsblock = async (req, res) => {
+    const targetId = requireObjectId(req.query.userId, 'user id')
+    res.status(200).json({ blocked: await fetchIsblockServ(targetId, String(req.user._id)) })
+}
+
+export const blockedUsers = async (req, res) => {
+    const userId = requireObjectId(req.params.id, 'user id')
+    if (userId !== String(req.user._id)) throw forbidden()
+    res.status(200).json({ users: await blockedUsersServ(userId) })
 }

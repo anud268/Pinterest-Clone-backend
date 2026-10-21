@@ -1,171 +1,95 @@
+import bcrypt from 'bcrypt'
+import crypto from 'crypto'
 import User from '../schema/userSchema.js'
-import Otp from '../schema/otpSchema.js'
+import Otp, { OTP_TTL_SECONDS } from '../schema/otpSchema.js'
 import Profile from '../schema/profileSchema.js'
+import { badRequest, HttpError } from '../utils/http.js'
+import { escapeRegex } from '../utils/validation.js'
 
-export const signupServ = async(data)=>{
-    try {
-        const user = await User.create(data)
-        return {user}
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const checkEmailServ = async(data)=>{
-    try {
-        console.log('check existing email-',data);
-        
-        const check = await User.findOne({email:data})
-        console.log('ueser check from serv-',check);
-        
-        return check
-    } catch (error) {
-        console.log(error);
-    }
-}
+const MAX_OTP_ATTEMPTS = 5
 
-export const reqOtpServ= async(email,otp)=>{
-    try {
-        const response = await Otp.create({email,otp})
-        return response
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const removeOtpServ = async(data)=>{
-    try {
-        const response = await Otp.findByIdAndDelete(data)
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+// Shape of a user as sent to the browser. Email is only included for the user themself or admins.
+export const toPublicUser = (user, profile, { includeEmail = false } = {}) => ({
+    _id: user._id,
+    fullname: user.fullname,
+    role: user.role || 'user',
+    adminblock: Boolean(user.adminblock),
+    image: profile?.image || null,
+    createdAt: user.createdAt,
+    ...(includeEmail ? { email: user.email } : {}),
+})
+
+export const findUserByEmailServ = (email, { withPassword = false } = {}) => {
+    // Case-insensitive so accounts created before emails were lower-cased still match
+    const query = User.findOne({ email: new RegExp(`^${escapeRegex(email)}$`, 'i') })
+    return withPassword ? query.select('+password') : query
 }
 
-
-export const signinServ= async(data)=>{
-    try {
-        const email= data.email
-        const possword= data.password
-        const user = await User.findOne({email})
-        console.log('check user:',user);
-        if(user){
-            return user
-        }else{
-            return {success:false}
-        }
-    } catch (error) {
-        console.log(error);
-    }
+export const signupServ = async ({ email, fullname, password }) => {
+    const hashedPassword = await bcrypt.hash(password, 10)
+    return User.create({ email, fullname, password: hashedPassword, emailVerified: false })
 }
 
-export const userDetialsServ=async(data)=>{
-    try {
-        const response = await User.findById(data)
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+// Creates a fresh code for `email` (replacing older ones) and returns the plain code.
+export const createOtpServ = async (email) => {
+    const code = crypto.randomInt(100000, 1000000).toString()
+    await Otp.deleteMany({ email })
+    await Otp.create({ email, otp: await bcrypt.hash(code, 8) })
+    return { code, ttlMinutes: OTP_TTL_SECONDS / 60 }
 }
 
+export const verifyOtpServ = async (email, code) => {
+    const otp = await Otp.findOne({ email }).sort({ createdAt: -1 })
+    const expired = !otp || Date.now() - otp.createdAt.getTime() > OTP_TTL_SECONDS * 1000
+    if (expired) throw badRequest('This code has expired. Please request a new one.')
+    if (otp.attempts >= MAX_OTP_ATTEMPTS) {
+        await Otp.deleteMany({ email })
+        throw new HttpError(429, 'Too many incorrect attempts. Please request a new code.')
+    }
+
+    const matches = await bcrypt.compare(String(code), otp.otp)
+    if (!matches) {
+        await Otp.updateOne({ _id: otp._id }, { $inc: { attempts: 1 } })
+        throw badRequest('That code is incorrect. Please check your email and try again.')
+    }
+    await Otp.deleteMany({ email })
+}
+
+export const markEmailVerifiedServ = (userId) =>
+    User.findByIdAndUpdate(userId, { emailVerified: true }, { new: true })
 
 // profile
 
-export const setProfileServ = async(data)=>{
-    try {
-        console.log('create profile-',data);
-        
-        const response = await Profile.create(data)
-        return response
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const updateProfileServ = async(userId,data)=>{
-    try {
-        console.log('data from services-',data);
-        if(data.image){
-            const response = await Profile.findOneAndUpdate({userId:userId},{image:data.image},{new:true})
-            return response
-        }else{
-            const response = await Profile.findOneAndUpdate({userId:userId},{
-                firstname:data.firstname,
-                lastname:data.lastname,
-                bio:data.bio,
-                country:data.country,
-                state:data.state
-            },{new:true})
-            return response
-        }
-        
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const FindUserProfile = async(data)=>{
-    try {
-        const response = await Profile.findOne({userId:data})
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+export const FindUserProfile = (userId) => Profile.findOne({ userId })
+
+export const upsertProfileServ = (userId, fields) =>
+    Profile.findOneAndUpdate({ userId }, { $set: fields, $setOnInsert: { userId } }, { new: true, upsert: true })
+
+export const fetchProfilePicServ = async (userId) => {
+    const profile = await Profile.findOne({ userId }, 'image')
+    return profile?.image || null
 }
 
-export const fetchProfilePicServ = async(data)=>{
-    try {
-        const response = await Profile.findOne({userId:data})
-        console.log('response of profile pic:',response);
-        return response.image
-        
-    } catch (error) {
-        console.log(error);
-    }
+// Map of userId -> profile image for a list of user ids
+export const profileImagesServ = async (userIds) => {
+    const profiles = await Profile.find({ userId: { $in: userIds } }, 'userId image').lean()
+    return new Map(profiles.map((p) => [String(p.userId), p.image]))
 }
 
-export const userBlockServ = async(id,data)=>{
-    try {
+// block (`userblock` on a user lists the ids of the people who blocked them)
 
-        console.log('heloooooo');
-        
-        const isBlock = await User.findOne({_id: id,userblock: { $in: data }});
-
-        console.log(isBlock,'isblock'); 
-        if(!isBlock){
-            const response = await User.findByIdAndUpdate(id,{$push:{userblock:data}},{new:true}) 
-            console.log(response,'+++++++++++++ PUSH +++++++++++++');
-            return {response,success:true}
-        }else{
-            const response = await User.findByIdAndUpdate(id,{$pull:{userblock:data}},{new:true})
-            console.log(response,'+++++++++++++ PULL +++++++++++++');
-            return {response,success:false}
-        }
-        
-
-        
-
-    } catch (error) {
-        console.log(error);
-    }
+export const userBlockServ = async (targetId, viewerId) => {
+    const alreadyBlocked = await User.exists({ _id: targetId, userblock: viewerId })
+    const update = alreadyBlocked ? { $pull: { userblock: viewerId } } : { $addToSet: { userblock: viewerId } }
+    await User.updateOne({ _id: targetId }, update)
+    return !alreadyBlocked
 }
 
-export const fetchIsblockServ = async(userId,blockUserId)=>{
-    try {
-         const isBlock = await User.findOne({_id: userId,userblock: { $in: blockUserId }});
-        if(isBlock){
-            return {success:true}
-        }else{
-            return {success:false}
-        }
-    } catch (error) {
-        console.log(error);
-    }
-}
+export const fetchIsblockServ = async (targetId, viewerId) =>
+    Boolean(await User.exists({ _id: targetId, userblock: viewerId }))
 
-export const blockedUsersServ =async(id)=>{
-    try {
-        const response = await User.find({userblock:{$in:id}}).sort({updatedAt:-1})
-        console.log(response,'oOoOoOoOoOoOoOoOoOo');
-        return response
-        
-    } catch (error) {
-        console.log(error);
-    }
+export const blockedUsersServ = async (viewerId) => {
+    const users = await User.find({ userblock: viewerId }).sort({ updatedAt: -1 })
+    const images = await profileImagesServ(users.map((u) => u._id))
+    return users.map((u) => toPublicUser(u, { image: images.get(String(u._id)) }))
 }

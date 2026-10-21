@@ -1,217 +1,153 @@
 import Post from '../schema/postSchema.js'
 import Tag from '../schema/tagSchema.js';
 import User from '../schema/userSchema.js';
+import { escapeRegex, normalizeTags } from '../utils/validation.js';
+import { profileImagesServ } from './user.js';
 
-export const uploadPostServ = async (post, tag) => {
-    try {
-        const response = await Post.create({
-            ...post,
-            tags: Array.isArray(tag) ? tag : [tag] // Ensure tags is always an array
-        });
-        return response;
-    } catch (error) {
-        console.log(error);
-    }
-};
-export const fetchPostServ = async(data)=>{
-    try {
-        const response = await Post.find({archive:false,adminStrike:false,interested:{$nin:data}}).sort({createdAt:-1}).populate({path:"userId", select:"fullname email adminblock",match: { adminblock: { $ne: true } ,userblock:{$nin:data}}})
-        const filteredResponse = response.filter(post => post.userId !== null);
-        return filteredResponse  
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const servViewPost =async(id)=>{
-    try {
-        const post = await Post.findById(id).populate({path:"userId", select:"fullname email adminblock"})
-        return post
-    } catch (error) {
-        console.log(error);
-    }
+const AUTHOR_FIELDS = 'fullname adminblock'
+
+// Authors whose posts a viewer must not see: admin-blocked accounts and users the viewer blocked.
+const hiddenAuthorIds = async (viewerId) => {
+    const users = await User.find({ $or: [{ adminblock: true }, { userblock: String(viewerId) }] }, '_id').lean()
+    return users.map((u) => u._id)
 }
 
-export const fetchMyPostServ = async(data)=>{
-    try {
-        const response = await Post.find({userId:data,archive:false}).sort({createdAt:-1})
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+// Query for posts that are publicly visible to `viewerId`.
+// `$ne: true` (not `false`) so posts created before these fields existed are included.
+export const visiblePostFilter = async (viewerId, extra = {}) => ({
+    archive: { $ne: true },
+    adminStrike: { $ne: true },
+    interested: { $ne: String(viewerId) },
+    userId: { $nin: await hiddenAuthorIds(viewerId) },
+    ...extra,
+})
+
+// Adds the author's profile image as `userId.image` on populated posts.
+export const withAuthorImages = async (posts) => {
+    const list = Array.isArray(posts) ? posts : [posts]
+    const authorIds = list.map((p) => p.userId?._id).filter(Boolean)
+    const images = await profileImagesServ(authorIds)
+    const result = list.map((p) => {
+        const json = p.toJSON()
+        if (json.userId?._id) json.userId.image = images.get(String(json.userId._id)) || null
+        return json
+    })
+    return Array.isArray(posts) ? result : result[0]
 }
-export const deletePostServ = async (data) =>{
-    try {
-        const response = await Post.findByIdAndDelete(data)
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+
+const findPage = async (filter, { skip = 0, limit = 30, sort = { createdAt: -1, _id: -1 } } = {}) => {
+    const docs = await Post.find(filter).sort(sort).skip(skip).limit(limit + 1).populate('userId', AUTHOR_FIELDS)
+    const hasMore = docs.length > limit
+    return { posts: await withAuthorImages(docs.slice(0, limit)), hasMore }
 }
-export const updatePostServ = async(postId,data)=>{
-    try {
-        console.log('update data:',data);
-        const response = await Post.findByIdAndUpdate(postId,data,{new:true})
-        console.log('update in service:',response);
-        return response
-    } catch (error) {
-        console.log(error);
+
+export const uploadPostServ = (post) => Post.create(post)
+
+export const fetchFeedServ = async (viewerId, page) => findPage(await visiblePostFilter(viewerId), page)
+
+export const servViewPost = (id) => Post.findById(id).populate('userId', AUTHOR_FIELDS)
+
+export const fetchRelatedServ = async (post, viewerId, limit = 24) => {
+    const tags = normalizeTags(post.tags)
+    const filter = await visiblePostFilter(viewerId, { _id: { $ne: post._id } })
+    if (tags.length) {
+        filter.tags = { $in: tags.map((t) => new RegExp(escapeRegex(t), 'i')) }
     }
+    const { posts } = await findPage(filter, { limit })
+    return posts
 }
+
+// Posts on a profile. Owners also see their own struck posts (flagged in the UI).
+export const fetchMyPostServ = async (authorId, { isOwner }) => {
+    const filter = { userId: authorId, archive: { $ne: true } }
+    if (!isOwner) filter.adminStrike = { $ne: true }
+    const docs = await Post.find(filter).sort({ createdAt: -1 }).populate('userId', AUTHOR_FIELDS)
+    return withAuthorImages(docs)
+}
+
+export const deletePostServ = (postId) => Post.findByIdAndDelete(postId)
+
+export const updatePostServ = (postId, data) => Post.findByIdAndUpdate(postId, data, { new: true, runValidators: true })
 
 //saved
 
-export const checkHaveUserServ =async(postId,userId)=>{
-    try {
-        const  response = await Post.findOne({ _id: postId, saved: userId })
-        // console.log('response of have user:',response);
-        
-        return response
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const pushSaveItem = async(postId,userId)=>{
-    try {
-        const response = await Post.findByIdAndUpdate(postId,{$push:{saved:userId}},{ new: true })
-        return response
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const pullsavedItem = async(postId,userId)=>{
-    try {
-        const response = await Post.findByIdAndUpdate(postId,{$pull:{saved:userId}},{ new: true })
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+export const toggleSaveServ = async (postId, userId) => {
+    const isSaved = await Post.exists({ _id: postId, saved: String(userId) })
+    const update = isSaved ? { $pull: { saved: String(userId) } } : { $addToSet: { saved: String(userId) } }
+    await Post.updateOne({ _id: postId }, update)
+    return !isSaved
 }
 
-export const fetchSavedPostsServ=async (data)=>{
-    try {
-        const response =await Post.find({saved:{$in:data},archive:false,adminStrike:false,interested:{$nin:data}}).sort({updatedAt:-1})
-        console.log('saved posts from serv:',response);
-        
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+export const fetchSavedPostsServ = async (userId) => {
+    const filter = await visiblePostFilter(userId, { saved: String(userId) })
+    const docs = await Post.find(filter).sort({ updatedAt: -1 }).populate('userId', AUTHOR_FIELDS)
+    return withAuthorImages(docs)
 }
 
 //archive
-export const pusharchiveServ = async(postId)=>{
-    try {
-        const response = await Post.findByIdAndUpdate(postId,{archive:true},{ new: true })
-        return response
-    } catch (error) {
-        console.log(error);
-    }
-}
-export const pullArchiveServ = async(postId)=>{
-    try {
-        const response = await Post.findByIdAndUpdate(postId,{archive:false},{ new: true })
-        return response
-    } catch (error) {
-        console.log(error);
-    }
-}
 
-export const fetchArchiveServ=async (id)=>{
-    try {
-        const response =await Post.find({archive:true,userId:{$eq:id}}).sort({updatedAt:-1})
-        console.log('archive posts from serv:',response);
-        
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+export const setArchiveServ = (postId, archive) => Post.findByIdAndUpdate(postId, { archive }, { new: true })
+
+export const fetchArchiveServ = async (userId) => {
+    const docs = await Post.find({ archive: true, userId }).sort({ updatedAt: -1 }).populate('userId', AUTHOR_FIELDS)
+    return withAuthorImages(docs)
 }
 
 // search
 
-export const searchTermsServ = async(searchValue,select,userId)=>{
-    try {
-        if(select=='Title'){
-            console.log('userId from search---',userId);
-            
-            const title = await Post.distinct("postTitle",{archive: { $ne: true } , postTitle:{ $regex: searchValue, $options: 'i' }})
-            console.log('title----',title);
-            
-            return title
-        }
-        else if(select=='Tag'){
-            const tag = await Post.distinct("tags",{archive: { $ne: true } , tags:{ $regex: searchValue, $options: 'i' }})
-            return tag
-        }
-        else if(select=='Location'){
-            const location = await Post.distinct("location",{archive: { $ne: true } , location:{ $regex: searchValue, $options: 'i' }})
-            return location
-        }
-        else if(select=='User'){
-            const user = await User.find({ fullname:{ $regex: searchValue, $options: 'i' }},{ _id: 1, fullname: 1 })
-            return user
-        }
+const SEARCH_FIELDS = { Title: 'postTitle', Tag: 'tags', Location: 'location' }
 
-    } catch (error) {
-        console.log(error);
+export const searchTermsServ = async (searchValue, select, viewerId) => {
+    const pattern = new RegExp(escapeRegex(searchValue), 'i')
+
+    if (select === 'User') {
+        const hidden = await hiddenAuthorIds(viewerId)
+        return User.find({ fullname: pattern, _id: { $nin: hidden }, role: { $ne: 'admin' } }, { _id: 1, fullname: 1 }).limit(8).lean()
     }
+
+    const field = SEARCH_FIELDS[select]
+    if (!field) return []
+    const values = await Post.distinct(field, await visiblePostFilter(viewerId, { [field]: pattern }))
+    const flat = field === 'tags' ? normalizeTags(values, 500) : values.filter(Boolean)
+    return [...new Set(flat)].filter((v) => pattern.test(v)).slice(0, 8)
 }
 
-export const finalSearchServ = async (searchValue,select)=>{
-    try {
-        if(select=='Title'){
-            const title = await Post.find({postTitle:{ $regex: searchValue, $options: 'i' }})
-            
-            return title
-        }
-        else if(select=='Tag'){
-            const tag = await Post.find({tags:{$regex: searchValue , $options:'i'}})
-            return tag
-        }
-        else if(select=='Location'){
-            const location = await Post.find({location:{ $regex: searchValue, $options: 'i' }})
-            return location
-        }
-
-    } catch (error) {
-        console.log(error);
-    }
+export const finalSearchServ = async (searchValue, select, viewerId, page) => {
+    const field = SEARCH_FIELDS[select]
+    if (!field) return { posts: [], hasMore: false }
+    const filter = await visiblePostFilter(viewerId, { [field]: new RegExp(escapeRegex(searchValue), 'i') })
+    return findPage(filter, page)
 }
 
-export const notInterestedServ =async(userId,postId)=>{
-    try {
-        const response = await Post.findByIdAndUpdate(postId,{$push:{interested:userId}},{ new: true })
-        return response
-    } catch (error) {
-        console.log(error);        
-    }
+// not interested
+
+export const notInterestedServ = (userId, postId) =>
+    Post.updateOne({ _id: postId }, { $addToSet: { interested: String(userId) } })
+
+export const fetchNotInterestedServ = async (userId) => {
+    const docs = await Post.find({ archive: { $ne: true }, interested: String(userId) })
+        .sort({ updatedAt: -1 })
+        .populate('userId', AUTHOR_FIELDS)
+    return withAuthorImages(docs)
 }
 
-export const fetchNotInterestedServ =async(data)=>{
-    try {
-        const response = await Post.find({archive:false,interested:{$in:data}}).sort({createdAt:-1}).populate({path:"userId", select:"fullname email adminblock",match: { adminblock: { $ne: true } }})
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+export const removeNotInterestServ = (postId, userId) =>
+    Post.updateOne({ _id: postId }, { $pull: { interested: String(userId) } })
+
+// tags
+
+export const applyTagServ = async (value) => {
+    const pattern = new RegExp(escapeRegex(value), 'i')
+    const docs = await Tag.find({ tags: pattern }, { tags: 1, _id: 0 }).lean()
+    return [...new Set(docs.flatMap((d) => d.tags))].filter((t) => pattern.test(t)).slice(0, 10)
 }
 
-export const removeNotInterestServ = async(postId,userId) =>{
-    try {
-        const response = await Post.findByIdAndUpdate(postId,{$pull:{interested:userId}},{ new: true })
-        return response
-    } catch (error) {
-        console.log(error);
-    }
-}
-
-export const applyTagServ=async(value)=>{
-    try {
-        const response =await Tag.find({tags:{$elemMatch:{$regex:value , $options:'i'}}},{tags:1,_id:0})
-        console.log('======',response,'======');
-        
-        return response
-    } catch (error) {
-        console.log(error);
-    }
+export const postsForCategoryServ = async (category, viewerId, page) => {
+    const docs = await Tag.find({ category }).lean()
+    const tags = docs.flatMap((d) => d.tags || [])
+    if (!tags.length) return { posts: [], hasMore: false }
+    const filter = await visiblePostFilter(viewerId, {
+        tags: { $in: tags.map((t) => new RegExp(escapeRegex(t), 'i')) },
+    })
+    return findPage(filter, page)
 }

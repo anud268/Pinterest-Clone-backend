@@ -5,26 +5,26 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": " nodemon index.js"
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
+    "start": "nodemon index.js",
+    "serve": "node index.js",
+    "migrate:tags": "node scripts/normalize-tags.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "bcrypt": "^6.0.0",
-    "cloudinary": "^2.7.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
-    "express-session": "^1.18.1",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.15.1",
     "multer": "^2.0.2",
-    "nodemailer": "^7.0.3",
-    "nodemon": "^3.1.10",
-    "passport": "^0.7.0",
-    "passport-google-oauth20": "^2.0.0",
-    "s3-easy-uploader": "^1.0.4"
+    "nodemailer": "^10.1.7"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^10.4.3",
+    "nodemon": "^3.1.14"
   }
 }

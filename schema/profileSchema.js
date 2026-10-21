@@ -8,4 +8,7 @@ const profileSchema = new mongoose.Schema({
     lastname:{type:String , default:null},
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" }
   }, { timestamps: true });
+
+profileSchema.index({ userId: 1 })
+
 export default mongoose.model('Profile',profileSchema)
