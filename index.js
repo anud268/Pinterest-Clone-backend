@@ -18,10 +18,13 @@ const CLIENT_ORIGINS = (process.env.CLIENT_ORIGINS || 'http://localhost:5173,htt
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+// On Vercel the app runs as a serverless function: no app.listen, no process.exit
+const IS_SERVERLESS = Boolean(process.env.VERCEL);
+
 const missing = ['MONGODB', 'SECRET_KEY'].filter((key) => !process.env[key]);
 if (missing.length) {
   console.error(`[Server] FATAL: Missing required environment variables: ${missing.join(', ')}. See .env.example.`);
-  process.exit(1);
+  if (!IS_SERVERLESS) process.exit(1);
 }
 for (const key of ['IMAGEKIT_PRIVATE_KEY', 'EMAIL', 'EMAIL_PASS']) {
   if (!process.env[key]) console.warn(`[Server] Warning: ${key} is not set; related features will not work.`);
@@ -47,6 +50,34 @@ app.use(
     credentials: true,
   })
 );
+
+// Serverless: connect once per warm instance, on the first request
+let dbReady;
+const connectDatabases = () => {
+  dbReady ??= (async () => {
+    await dbConnect();
+    await connectChatDb();
+  })().catch((err) => {
+    dbReady = undefined;
+    throw err;
+  });
+  return dbReady;
+};
+
+if (IS_SERVERLESS) {
+  app.use(async (req, res, next) => {
+    if (missing.length) {
+      return res.status(500).json({ message: `Server is missing environment variables: ${missing.join(', ')}` });
+    }
+    try {
+      await connectDatabases();
+      next();
+    } catch (err) {
+      console.error('[Server] Could not connect to MongoDB:', err.message);
+      res.status(503).json({ message: 'Could not connect to the database' });
+    }
+  });
+}
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 // Chat key batches (Olm-encrypted room keys for several devices) can exceed 100kb
@@ -136,4 +167,6 @@ const startServer = async () => {
   }
 };
 
-startServer();
+if (!IS_SERVERLESS) startServer();
+
+export default app;
