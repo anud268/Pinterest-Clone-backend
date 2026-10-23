@@ -10,7 +10,8 @@ const isProduction = () => process.env.NODE_ENV === 'production';
 const cookieOptions = () => ({
   httpOnly: true,
   secure: isProduction(),
-  sameSite: 'lax',
+  // Frontend and API are on different sites in production, so the cookie must be cross-site
+  sameSite: isProduction() ? 'none' : 'lax',
   path: '/',
 });
 
